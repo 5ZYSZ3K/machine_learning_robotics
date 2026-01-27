@@ -1,23 +1,18 @@
-import sys
-import time
-import math
 import random
+import time
+import numpy as np
+import math 
 import cv2
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
-import torch
-import torch.nn as nn
 import carla
-# Make sure CARLA PythonAPI is on the path (tweak to where you put CARLA)
-sys.path.append("E:/CARLA_0.9.15/WindowsNoEditor/PythonAPI/carla")
+import sys
+sys.path.append('E:/CARLA_0.9.15/WindowsNoEditor/PythonAPI/carla') # tweak to where you put carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
-
-
 SECONDS_PER_EPISODE = 25
 
 N_CHANNELS = 3
-HEIGHT = 160
+HEIGHT = 180
 WIDTH = 240
 
 FIXED_DELTA_SECONDS = 0.2
@@ -25,383 +20,258 @@ FIXED_DELTA_SECONDS = 0.2
 SHOW_PREVIEW = True
 
 class CarEnvironment(gym.Env):
-    SHOW_CAM = SHOW_PREVIEW
-    STEER_AMT = 1.0
-    im_width = WIDTH
-    im_height = HEIGHT
-    front_camera = None
-    CAMERA_POS_Z = 1.3
-    CAMERA_POS_X = 1.4
-    PREFERRED_SPEED = 20
-    SPEED_THRESHOLD = 2
+	SHOW_CAM = SHOW_PREVIEW
+	STEER_AMT = 1.0
+	im_width = WIDTH
+	im_height = HEIGHT
+	front_camera = None
+	CAMERA_POS_Z = 1.3 
+	CAMERA_POS_X = 1.4
+	PREFERRED_SPEED = 20 # what it says
+	SPEED_THRESHOLD = 2 #defines when we get close to desired speed so we drop the
+	
+	def __init__(self):
+		super(CarEnvironment, self).__init__()
+        # Define action and observation space
+        # They must be gym.spaces objects
 
-    metadata = {"render.modes": []}
+		self.action_space = spaces.MultiDiscrete([9])
+        # First discrete variable with 9 possible actions for steering with middle being straight
+        # Second discrete variable with 4 possible actions for throttle/braking
 
-    def __init__(self):
-        super().__init__()
+        # Example for using image as input normalised to 0..1 (channel-first; channel-last also works):
+		# adding a separate input of an angle to a close waypoint along the route
+		
+		# old dict 
+		#self.observation_space = spaces.Dict({
+        #    'image': spaces.Box(low=0.0, high=1.0,shape=(HEIGHT, WIDTH, N_CHANNELS), dtype=np.float32),
+        #    'float_input': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        #})
 
-        # Action space: 9 discrete steering values (mapped to [-0.9, 0.9])
-        # We keep MultiDiscrete for compatibility with existing mapping
-        self.action_space = spaces.MultiDiscrete([9])
+		self.observation_space = spaces.Dict({
+            'image': spaces.Box(low=0.0, high=1.0,shape=(HEIGHT, WIDTH, N_CHANNELS), dtype=np.float32),
+            'angle': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        })
 
-        # Observation space: dict with image and angle to next waypoint
-        self.observation_space = spaces.Dict(
-            {
-                "image": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(HEIGHT, WIDTH, N_CHANNELS),
-                    dtype=np.float32,
-                ),
-                "angle": spaces.Box(
-                    low=-1.0,
-                    high=1.0,
-                    shape=(1,),
-                    dtype=np.float32,
-                ),
-            }
-        )
 
-        self.client = carla.Client("localhost", 2000)
-        self.client.set_timeout(4.0)
-        self.world = self.client.get_world()
+		self.client = carla.Client("localhost", 2000)
+		self.client.set_timeout(4.0)
+		self.world = self.client.get_world()
 
-        self.settings = self.world.get_settings()
-        self.settings.no_rendering_mode = True
-        self.settings.synchronous_mode = False
-        self.settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
-        self.world.apply_settings(self.settings)
-        self.blueprint_library = self.world.get_blueprint_library()
-        self.model_3 = self.blueprint_library.filter("model3")[0]
-        self.route = None
+		self.settings = self.world.get_settings()
+		self.settings.no_rendering_mode = True
+		self.settings.synchronous_mode = False
+		self.settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
+		self.world.apply_settings(self.settings)
+		self.blueprint_library = self.world.get_blueprint_library()
+		self.model_3 = self.blueprint_library.filter("model3")[0]
+		self.route = None
+	
+	def select_random_route(self):
+		'''
+		retruns a random route for the car/veh
+		out of the list of possible locations locs
+		where distance is longer than 100 waypoints
+		'''    
+		current_location = self.vehicle.get_transform().location 
+		sampling_resolution = 1
+		route_planner = GlobalRoutePlanner(self.world.get_map(), sampling_resolution)
+		min_waypoints_distance = 100
+		candidate_routes = []
+		for spawn_point in self.world.get_map().get_spawn_points(): 
+			route_candidate = route_planner.trace_route(current_location, spawn_point.location)
+			if len(route_candidate) > min_waypoints_distance:
+				candidate_routes.append(route_candidate)
+		selected_route = random.choice(candidate_routes)
+		return selected_route
 
-    def select_random_route(self):
-        """
-        Returns a random route for the car/vehicle
-        where distance is longer than 100 waypoints.
-        """
-        point_a = self.vehicle.get_transform().location
-        sampling_resolution = 1
-        grp = GlobalRoutePlanner(self.world.get_map(), sampling_resolution)
+	def get_closest_wp_forward(self):
+		forward_waypoints = []
+		behind_waypoints = []
+		for waypoint_index, route_waypoint in enumerate(self.route):
+			vehicle_transform = self.vehicle.get_transform()
+			waypoint_transform = route_waypoint[0].transform
+			distance_to_waypoint = ((waypoint_transform.location.y - vehicle_transform.location.y)**2 + (waypoint_transform.location.x - vehicle_transform.location.x)**2)**0.5
+			angle_to_waypoint = math.degrees(math.atan2(waypoint_transform.location.y - vehicle_transform.location.y,
+								waypoint_transform.location.x - vehicle_transform.location.x)) -  vehicle_transform.rotation.yaw
+			if angle_to_waypoint>360:
+				angle_to_waypoint = angle_to_waypoint - 360
+			elif angle_to_waypoint <-360:
+				angle_to_waypoint = angle_to_waypoint + 360
 
-        min_distance = 100
-        route_list = []
-        for loc in self.world.get_map().get_spawn_points():
-            cur_route = grp.trace_route(point_a, loc.location)
-            if len(cur_route) > min_distance:
-                route_list.append(cur_route)
+			if angle_to_waypoint>180:
+				angle_to_waypoint = -360 + angle_to_waypoint
+			elif angle_to_waypoint <-180:
+				angle_to_waypoint = 360 - angle_to_waypoint 
+			if abs(angle_to_waypoint)<=90:
+				forward_waypoints.append([waypoint_index,distance_to_waypoint,angle_to_waypoint])
+			else:
+				behind_waypoints.append([waypoint_index,distance_to_waypoint,angle_to_waypoint])
 
-        if not route_list:
-            # Fallback: just use shortest route to any spawn point
-            for loc in self.world.get_map().get_spawn_points():
-                cur_route = grp.trace_route(point_a, loc.location)
-                if cur_route:
-                    route_list.append(cur_route)
+		if len(forward_waypoints)==0:
+			closest_waypoint = min(behind_waypoints, key=lambda x: x[1])
+			if closest_waypoint[2]>0:
+				closest_waypoint = [closest_waypoint[0],closest_waypoint[1],90]
+			else:
+				closest_waypoint = [closest_waypoint[0],closest_waypoint[1],-90] 
+		else:
+			closest_waypoint = min(forward_waypoints, key=lambda x: x[1])
 
-        return random.choice(route_list)
+			for waypoint_index, candidate_waypoint in enumerate(forward_waypoints):
+				if candidate_waypoint[1]>=10 and candidate_waypoint[1]<20:
+					closest_waypoint = candidate_waypoint
+					break
+			return closest_waypoint[2]/90.0, closest_waypoint[1] 
+			
+	def cleanup(self):
+		for sensor in self.world.get_actors().filter('*sensor*'):
+			sensor.destroy()
+		for actor in self.world.get_actors().filter('*vehicle*'):
+			actor.destroy()
+		cv2.destroyAllWindows()
+	
+	def maintain_speed(self,current_speed):
+			''' 
+			this is a very simple function to maintan desired speed
+			s arg is actual current speed
+			'''
+			if current_speed >= self.PREFERRED_SPEED:
+				return 0
+			elif current_speed < self.PREFERRED_SPEED - self.SPEED_THRESHOLD:
+				return 0.7 
+			else:
+				return 0.3 
+	
+	def step(self, action):
+		self.step_counter +=1
+		steer = action[0]
+		
+		if steer ==0:
+			steer = - 0.9
+		elif steer ==1:
+			steer = -0.25
+		elif steer ==2:
+			steer = -0.1
+		elif steer ==3:
+			steer = -0.05
+		elif steer ==4:
+			steer = 0.0 
+		elif steer ==5:
+			steer = 0.05
+		elif steer ==6:
+			steer = 0.1
+		elif steer ==7:
+			steer = 0.25
+		elif steer ==8:
+			steer = 0.9
+		# map throttle to maintain speed and apply steer and throttle	
+		velocity_vector = self.vehicle.get_velocity()
+		speed_kmh = int(3.6 * math.sqrt(velocity_vector.x**2 + velocity_vector.y**2 + velocity_vector.z**2))
+		estimated_throttle = self.maintain_speed(speed_kmh)
+		self.vehicle.apply_control(carla.VehicleControl(throttle=estimated_throttle, steer=steer, brake = 0.0))
+		
+		if self.step_counter % 50 == 0:
+			print('steer input from model:',steer)
+		
+		total_distance_travelled = self.initial_location.distance(self.vehicle.get_location())
+		step_distance_gain = 0
+		if self.distance_travelled_last < total_distance_travelled:
+			step_distance_gain = total_distance_travelled - self.distance_travelled_last
+			self.distance_travelled_last < total_distance_travelled
 
-    def get_closest_wp_forward(self):
-        """
-        Find closest waypoint looking forward.
-        Returns (angle_normalized, distance).
-        """
-        points_ahead = []
-        points_behind = []
-        for i, wp in enumerate(self.route):
-            vehicle_transform = self.vehicle.get_transform()
-            wp_transform = wp[0].transform
-            distance = (
-                (wp_transform.location.y - vehicle_transform.location.y) ** 2
-                + (wp_transform.location.x - vehicle_transform.location.x) ** 2
-            ) ** 0.5
-            angle = math.degrees(
-                math.atan2(
-                    wp_transform.location.y - vehicle_transform.location.y,
-                    wp_transform.location.x - vehicle_transform.location.x,
-                )
-            ) - vehicle_transform.rotation.yaw
+		camera_image = self.front_camera
 
-            if angle > 360:
-                angle = angle - 360
-            elif angle < -360:
-                angle = angle + 360
+		if self.SHOW_CAM:
+			cv2.imshow('Sem Camera', camera_image)
+			cv2.waitKey(1)
+		
+		angle_to_route, distance_to_route = None, None
+		while angle_to_route is None:
+			try:
+				angle_to_route, distance_to_route = self.get_closest_wp_forward()
+			except:
+				pass
+			
+		reward = 0
+		done = False
+		if len(self.collision_hist) != 0:
+			done = True
+			reward = reward-200
+			self.cleanup()
+			
+		# punish for deviating from the route
+		route_loss =  distance_to_route - self.last_distance_to_route 
+		if route_loss<-0.1:
+			reward = reward + 10 #reward for getting closer to the route
+		elif route_loss < 0.1:
+			reward = reward + 1
+		else:
+			reward = reward - 2
+		if distance_to_route > 20:
+			reward = reward - 100
+		# reward for making distance
+		reward = reward + int(round(step_distance_gain*3,0))
+		# check for episode duration
+		if self.episode_start + SECONDS_PER_EPISODE < time.time():
+			done = True
+			self.cleanup()
+		return  {'image': self.front_camera/255.0, 'angle': angle_to_route}, reward, done, False, {}
 
-            if angle > 180:
-                angle = -360 + angle
-            elif angle < -180:
-                angle = 360 - angle
+	def reset(self, seed=None):
+		self.collision_hist = []
+		self.actor_list = []
+		self.transform = random.choice(self.world.get_map().get_spawn_points())
+		if seed:
+			self.seed = seed
+		self.vehicle = None
+		while self.vehicle is None:
+			try:
+				self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
+			except:
+				pass
+		self.actor_list.append(self.vehicle)
+		self.initial_location = self.vehicle.get_location()
+		self.semantic_segmentation_camera_blueprint = self.blueprint_library.find('sensor.camera.semantic_segmentation')
+		self.semantic_segmentation_camera_blueprint.set_attribute("image_size_x", f"{self.im_width}")
+		self.semantic_segmentation_camera_blueprint.set_attribute("image_size_y", f"{self.im_height}")
+		self.semantic_segmentation_camera_blueprint.set_attribute("fov", f"90")
 
-            if abs(angle) <= 90:
-                points_ahead.append([i, distance, angle])
-            else:
-                points_behind.append([i, distance, angle])
+		
+		camera_init_trans = carla.Transform(carla.Location(z=self.CAMERA_POS_Z,x=self.CAMERA_POS_X))
+		self.sensor = self.world.spawn_actor(self.semantic_segmentation_camera_blueprint, camera_init_trans, attach_to=self.vehicle)
+		self.actor_list.append(self.sensor)
+		self.sensor.listen(lambda data: self.process_img(data))
 
-        if len(points_ahead) == 0:
-            closest = min(points_behind, key=lambda x: x[1])
-            if closest[2] > 0:
-                closest = [closest[0], closest[1], 90]
-            else:
-                closest = [closest[0], closest[1], -90]
-        else:
-            closest = min(points_ahead, key=lambda x: x[1])
-            # move forward if too close
-            for point in points_ahead:
-                if 10 <= point[1] < 20:
-                    closest = point
-                    break
+		self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
+		time.sleep(2)
+		if self.SHOW_CAM:
+			cv2.namedWindow('Sem Camera',cv2.WINDOW_AUTOSIZE)
+			cv2.imshow('Sem Camera', self.front_camera)
+			cv2.waitKey(1)
+		collision_sensor_blueprint = self.blueprint_library.find("sensor.other.collision")
+		self.colsensor = self.world.spawn_actor(collision_sensor_blueprint, camera_init_trans, attach_to=self.vehicle)
+		self.actor_list.append(self.colsensor)
+		self.colsensor.listen(lambda event: self.collision_data(event))
 
-        return closest[2] / 90.0, closest[1]
+		while self.front_camera is None:
+			time.sleep(0.01)
+		
+		self.episode_start = time.time()
+		self.steering_lock = False
+		self.step_counter = 0
+		self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
+		self.distance_travelled_last = 0
+		self.route = self.select_random_route()
+		angle_to_route, distance_to_route = self.get_closest_wp_forward()
+		self.last_distance_to_route = distance_to_route
+		return {'image': (self.front_camera/255.0), 'angle': angle_to_route}, {}
 
-    def cleanup(self):
-        for sensor in self.world.get_actors().filter("*sensor*"):
-            sensor.destroy()
-        for actor in self.world.get_actors().filter("*vehicle*"):
-            actor.destroy()
-        cv2.destroyAllWindows()
+	def process_img(self, image):
+		image.convert(carla.ColorConverter.CityScapesPalette)
+		image_array = np.array(image.raw_data)
+		image_array = image_array.reshape((self.im_height, self.im_width, 4))[:, :, :3]
+		self.front_camera = image_array
 
-    def maintain_speed(self, s: float):
-        """
-        Very simple function to maintain desired speed.
-
-        s arg is actual current speed in km/h.
-        """
-        if s >= self.PREFERRED_SPEED:
-            return 0.0
-        elif s < self.PREFERRED_SPEED - self.SPEED_THRESHOLD:
-            return 0.7  # think of it as % of "full gas"
-        else:
-            return 0.3  # tweak this if the car is way over or under preferred speed
-
-    def _map_action_to_steer(self, action):
-        # Mapping from discrete id to steering value
-        mapping = {
-            0: -0.9,
-            1: -0.25,
-            2: -0.1,
-            3: -0.05,
-            4: 0.0,
-            5: 0.05,
-            6: 0.1,
-            7: 0.25,
-            8: 0.9,
-        }
-        return mapping.get(int(action), 0.0)
-
-    def step(self, action):
-        self.step_counter += 1
-
-        # MultiDiscrete([9]) -> take first component
-        steer_idx = action[0] if isinstance(action, (list, np.ndarray)) else action
-        steer = self._map_action_to_steer(steer_idx)
-
-        # map throttle to maintain speed and apply steer and throttle
-        v = self.vehicle.get_velocity()
-        kmh = int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
-        estimated_throttle = self.maintain_speed(kmh)
-        self.vehicle.apply_control(
-            carla.VehicleControl(throttle=estimated_throttle, steer=steer, brake=0.0)
-        )
-
-        if self.step_counter % 50 == 0:
-            print("steer input from model:", steer)
-
-        distance_travelled = self.initial_location.distance(self.vehicle.get_location())
-        step_distance_gain = 0.0
-        if self.distance_travelled_last < distance_travelled:
-            step_distance_gain = distance_travelled - self.distance_travelled_last
-            self.distance_travelled_last = distance_travelled
-
-        cam = self.front_camera
-        if self.SHOW_CAM and cam is not None:
-            cv2.imshow("Sem Camera", cam)
-            cv2.waitKey(1)
-
-        # get angle and distance to the navigation route
-        angle, distance = None, None
-        while angle is None:
-            try:
-                angle, distance = self.get_closest_wp_forward()
-            except Exception:
-                pass
-
-        reward = 0.0
-        terminated = False
-        truncated = False
-
-        # punish for collision
-        if len(self.collision_hist) != 0:
-            terminated = True
-            reward -= 200.0
-            self.cleanup()
-
-        # punish for deviating from the route
-        route_loss = distance - self.last_distance_to_route
-        if route_loss < -0.1:
-            reward += 10.0  # reward for getting closer to the route
-        elif route_loss < 0.1:
-            reward += 1.0
-        else:
-            reward -= 2.0
-        if distance > 20:
-            reward -= 100.0
-
-        # reward for making distance
-        reward += float(int(round(step_distance_gain * 3, 0)))
-
-        # check for episode duration
-        if self.episode_start + SECONDS_PER_EPISODE < time.time():
-            truncated = True
-            self.cleanup()
-
-        obs = {"image": self.front_camera / 255.0, "angle": np.array([angle], dtype=np.float32)}
-        return obs, reward, terminated, truncated, {}
-
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
-
-        self.collision_hist = []
-        self.actor_list = []
-        self.transform = random.choice(self.world.get_map().get_spawn_points())
-
-        self.vehicle = None
-        while self.vehicle is None:
-            try:
-                self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
-            except Exception:
-                self.vehicle = None
-
-        self.actor_list.append(self.vehicle)
-        self.initial_location = self.vehicle.get_location()
-
-        self.sem_cam = self.blueprint_library.find("sensor.camera.semantic_segmentation")
-        self.sem_cam.set_attribute("image_size_x", f"{self.im_width}")
-        self.sem_cam.set_attribute("image_size_y", f"{self.im_height}")
-        self.sem_cam.set_attribute("fov", "90")
-
-        camera_init_trans = carla.Transform(
-            carla.Location(z=self.CAMERA_POS_Z, x=self.CAMERA_POS_X)
-        )
-        self.sensor = self.world.spawn_actor(
-            self.sem_cam, camera_init_trans, attach_to=self.vehicle
-        )
-        self.actor_list.append(self.sensor)
-        self.sensor.listen(lambda data: self.process_img(data))
-
-        self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
-        time.sleep(2)
-
-        if self.SHOW_CAM and self.front_camera is not None:
-            cv2.namedWindow("Sem Camera", cv2.WINDOW_AUTOSIZE)
-            cv2.imshow("Sem Camera", self.front_camera)
-            cv2.waitKey(1)
-
-        colsensor = self.blueprint_library.find("sensor.other.collision")
-        self.colsensor = self.world.spawn_actor(
-            colsensor, camera_init_trans, attach_to=self.vehicle
-        )
-        self.actor_list.append(self.colsensor)
-        self.colsensor.listen(lambda event: self.collision_data(event))
-
-        while self.front_camera is None:
-            time.sleep(0.01)
-
-        self.episode_start = time.time()
-        self.steering_lock = False
-        self.steering_lock_start = None
-        self.step_counter = 0
-        self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
-        self.distance_travelled_last = 0.0
-        self.route = self.select_random_route()
-        angle, distance_to_route = self.get_closest_wp_forward()
-        self.last_distance_to_route = distance_to_route
-
-        obs = {
-            "image": self.front_camera / 255.0,
-            "angle": np.array([angle], dtype=np.float32),
-        }
-        return obs, {}
-
-    def process_img(self, image):
-        image.convert(carla.ColorConverter.CityScapesPalette)
-        i = np.array(image.raw_data)
-        i = i.reshape((self.im_height, self.im_width, 4))[:, :, :3]
-        self.front_camera = i.astype(np.uint8)
-
-    def collision_data(self, event):
-        self.collision_hist.append(event)
-
-class ActorCritic(nn.Module):
-    def __init__(self, num_actions):
-        super().__init__()
-
-        # CNN for image
-        self.cnn = nn.Sequential(
-            nn.Conv2d(N_CHANNELS, 16, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-
-        # compute conv output size lazily
-        with torch.no_grad():
-            dummy = torch.zeros(1, N_CHANNELS, HEIGHT, WIDTH)
-            conv_out_size = self.cnn(dummy).shape[1]
-
-        self.fc = nn.Sequential(
-            nn.Linear(conv_out_size + 1, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-        )
-
-        self.policy_head = nn.Linear(128, num_actions)
-        self.value_head = nn.Linear(128, 1)
-
-    def forward(self, image: torch.Tensor, angle: torch.Tensor):
-        # image: (B, C, H, W), angle: (B, 1)
-        x = self.cnn(image)
-        x = torch.cat([x, angle], dim=1)
-        x = self.fc(x)
-        logits = self.policy_head(x)
-        value = self.value_head(x)
-        return logits, value
-
-    def act(self, obs, device):
-        image = obs["image"]
-        angle = obs["angle"]
-
-        if isinstance(image, np.ndarray):
-            image_t = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0)
-        else:
-            raise TypeError("Expected image as numpy array")
-
-        if isinstance(angle, np.ndarray):
-            angle_t = torch.from_numpy(angle.astype(np.float32)).view(1, -1)
-        else:
-            angle_t = torch.tensor([[float(angle)]], dtype=torch.float32)
-
-        image_t = image_t.to(device)
-        angle_t = angle_t.to(device)
-
-        logits, value = self.forward(image_t, angle_t)
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        logprob = dist.log_prob(action)
-
-        return (
-            action.cpu().numpy()[0],
-            logprob.detach().cpu().numpy()[0],
-            value.detach().cpu().numpy()[0, 0],
-        )
-
-    def evaluate_actions(
-        self, images: torch.Tensor, angles: torch.Tensor, actions: torch.Tensor
-    ):
-        logits, values = self.forward(images, angles)
-        dist = torch.distributions.Categorical(logits=logits)
-        logprobs = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return logprobs, torch.squeeze(values, -1), entropy
+	def collision_data(self, collision_event):
+		self.collision_hist.append(collision_event)
+	
