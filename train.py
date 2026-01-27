@@ -76,139 +76,138 @@ def main():
     ep_reward = 0.0
 
     try:
-        while timestep < max_env_steps:
-            # collect trajectories
-            while len(reward_buffer) < update_timesteps:
-                action, logprob, value = policy.act(obs, device)
+        # collect trajectories
+        while len(reward_buffer) < update_timesteps:
+            action, logprob, value = policy.act(obs, device)
 
-                # env expects MultiDiscrete([9]) -> wrap action in array
-                next_obs, reward, terminated, truncated, _ = env.step(np.array([action]))
-                done = terminated or truncated
+            # env expects MultiDiscrete([9]) -> wrap action in array
+            next_obs, reward, terminated, truncated, _ = env.step(np.array([action]))
+            done = terminated or truncated
 
-                obs_buffer.append(obs["image"])
-                angle_buffer.append(obs["angle"])
-                action_buffer.append(action)
-                logprob_buffer.append(logprob)
-                reward_buffer.append(reward)
-                done_buffer.append(float(done))
-                value_buffer.append(value)
+            obs_buffer.append(obs["image"])
+            angle_buffer.append(obs["angle"])
+            action_buffer.append(action)
+            logprob_buffer.append(logprob)
+            reward_buffer.append(reward)
+            done_buffer.append(float(done))
+            value_buffer.append(value)
 
-                ep_reward += reward
-                timestep += 1
+            ep_reward += reward
+            timestep += 1
 
-                obs = next_obs
+            obs = next_obs
 
-                if done:
-                    episode_rewards.append(ep_reward)
-                    print(
-                        f"Step {timestep} | Episode reward: {ep_reward:.1f} | Episodes: {len(episode_rewards)}"
-                    )
-                    ep_reward = 0.0
-                    obs, _ = env.reset()
-
-                if timestep >= max_env_steps:
-                    break
-
-            # Add last value for GAE
-            with torch.no_grad():
-                _, last_value = policy.forward(
-                    torch.from_numpy(obs["image"])
-                    .float()
-                    .permute(2, 0, 1)
-                    .unsqueeze(0)
-                    .to(device),
-                    torch.from_numpy(obs["angle"].astype(np.float32))
-                    .view(1, -1)
-                    .to(device),
+            if done:
+                episode_rewards.append(ep_reward)
+                print(
+                    f"Step {timestep} | Episode reward: {ep_reward:.1f} | Episodes: {len(episode_rewards)}"
                 )
-                last_value = last_value.cpu().numpy()[0, 0]
+                ep_reward = 0.0
+                obs, _ = env.reset()
 
-            values_np = np.array(value_buffer + [last_value], dtype=np.float32)
-            rewards_np = np.array(reward_buffer, dtype=np.float32)
-            dones_np = np.array(done_buffer, dtype=np.float32)
+            if timestep >= max_env_steps:
+                break
 
-            advantages, returns = compute_gae(
-                rewards_np, dones_np, values_np, gamma=gamma, lam=gae_lambda
-            )
-
-            # Normalize advantages
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-            # Prepare tensors
-            images_t = (
-                torch.from_numpy(np.stack(obs_buffer))
+        # Add last value for GAE
+        with torch.no_grad():
+            _, last_value = policy.forward(
+                torch.from_numpy(obs["image"])
                 .float()
-                .permute(0, 3, 1, 2)
-                .to(device)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(device),
+                torch.from_numpy(obs["angle"].astype(np.float32))
+                .view(1, -1)
+                .to(device),
             )
-            angles_t = (
-                torch.from_numpy(np.stack(angle_buffer).astype(np.float32))
-                .view(-1, 1)
-                .to(device)
-            )
-            actions_t = torch.from_numpy(np.array(action_buffer)).long().to(device)
-            old_logprobs_t = torch.from_numpy(np.array(logprob_buffer)).float().to(device)
-            returns_t = torch.from_numpy(returns).float().to(device)
-            advantages_t = torch.from_numpy(advantages).float().to(device)
+            last_value = last_value.cpu().numpy()[0, 0]
 
-            dataset_size = len(reward_buffer)
-            indices = np.arange(dataset_size)
+        values_np = np.array(value_buffer + [last_value], dtype=np.float32)
+        rewards_np = np.array(reward_buffer, dtype=np.float32)
+        dones_np = np.array(done_buffer, dtype=np.float32)
 
-            for _ in range(epochs):
-                np.random.shuffle(indices)
-                for start in range(0, dataset_size, batch_size):
-                    end = start + batch_size
-                    mb_idx = indices[start:end]
+        advantages, returns = compute_gae(
+            rewards_np, dones_np, values_np, gamma=gamma, lam=gae_lambda
+        )
 
-                    mb_images = images_t[mb_idx]
-                    mb_angles = angles_t[mb_idx]
-                    mb_actions = actions_t[mb_idx]
-                    mb_old_logprobs = old_logprobs_t[mb_idx]
-                    mb_returns = returns_t[mb_idx]
-                    mb_advantages = advantages_t[mb_idx]
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                    new_logprobs, values, entropy = policy.evaluate_actions(
-                        mb_images, mb_angles, mb_actions
-                    )
+        # Prepare tensors
+        images_t = (
+            torch.from_numpy(np.stack(obs_buffer))
+            .float()
+            .permute(0, 3, 1, 2)
+            .to(device)
+        )
+        angles_t = (
+            torch.from_numpy(np.stack(angle_buffer).astype(np.float32))
+            .view(-1, 1)
+            .to(device)
+        )
+        actions_t = torch.from_numpy(np.array(action_buffer)).long().to(device)
+        old_logprobs_t = torch.from_numpy(np.array(logprob_buffer)).float().to(device)
+        returns_t = torch.from_numpy(returns).float().to(device)
+        advantages_t = torch.from_numpy(advantages).float().to(device)
 
-                    ratio = torch.exp(new_logprobs - mb_old_logprobs)
-                    surr1 = ratio * mb_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
+        dataset_size = len(reward_buffer)
+        indices = np.arange(dataset_size)
 
-                    value_loss = nn.functional.mse_loss(values, mb_returns)
-                    entropy_loss = -entropy.mean()
+        for _ in range(epochs):
+            np.random.shuffle(indices)
+            for start in range(0, dataset_size, batch_size):
+                end = start + batch_size
+                mb_idx = indices[start:end]
 
-                    loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+                mb_images = images_t[mb_idx]
+                mb_angles = angles_t[mb_idx]
+                mb_actions = actions_t[mb_idx]
+                mb_old_logprobs = old_logprobs_t[mb_idx]
+                mb_returns = returns_t[mb_idx]
+                mb_advantages = advantages_t[mb_idx]
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
-                    optimizer.step()
+                new_logprobs, values, entropy = policy.evaluate_actions(
+                    mb_images, mb_angles, mb_actions
+                )
 
-            print(
-                f"PPO update at step {timestep} | mean ep reward (last 10): "
-                f"{np.mean(episode_rewards[-10:]) if episode_rewards else 0.0:.1f}"
-            )
+                ratio = torch.exp(new_logprobs - mb_old_logprobs)
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Clear buffers
-            obs_buffer.clear()
-            angle_buffer.clear()
-            action_buffer.clear()
-            logprob_buffer.clear()
-            reward_buffer.clear()
-            done_buffer.clear()
-            value_buffer.clear()
+                value_loss = nn.functional.mse_loss(values, mb_returns)
+                entropy_loss = -entropy.mean()
 
-            # Save model periodically
-            torch.save(
-                {
-                    "policy_state_dict": policy.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "timestep": timestep,
-                },
-                os.path.join(models_dir, f"ppo_step_{timestep}.pt"),
-            )
+                loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                optimizer.step()
+
+        print(
+            f"PPO update at step {timestep} | mean ep reward (last 10): "
+            f"{np.mean(episode_rewards[-10:]) if episode_rewards else 0.0:.1f}"
+        )
+
+        # Clear buffers
+        obs_buffer.clear()
+        angle_buffer.clear()
+        action_buffer.clear()
+        logprob_buffer.clear()
+        reward_buffer.clear()
+        done_buffer.clear()
+        value_buffer.clear()
+
+        # Save model periodically
+        torch.save(
+            {
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "timestep": timestep,
+            },
+            os.path.join(models_dir, f"ppo_step_{timestep}.pt"),
+        )
 
     except KeyboardInterrupt:
         print("Training interrupted by user.")
