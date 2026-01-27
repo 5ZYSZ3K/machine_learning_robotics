@@ -53,9 +53,9 @@ def main():
 
     # PPO hyperparameters
     max_env_steps = 2_000_000
-    update_timesteps = 128
+    update_timesteps = 16
     epochs = 10
-    batch_size = 1024
+    batch_size = 16
     gamma = 0.99
     gae_lambda = 0.95
     clip_eps = 0.2
@@ -154,8 +154,7 @@ def main():
             dataset_size = len(reward_buffer)
             indices = np.arange(dataset_size)
 
-            # PPO update
-            for epoch in range(epochs):
+            for _ in range(epochs):
                 np.random.shuffle(indices)
                 for start in range(0, dataset_size, batch_size):
                     end = start + batch_size

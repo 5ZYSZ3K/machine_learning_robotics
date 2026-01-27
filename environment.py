@@ -17,8 +17,8 @@ from agents.navigation.global_route_planner import GlobalRoutePlanner
 SECONDS_PER_EPISODE = 25
 
 N_CHANNELS = 3
-HEIGHT = 240
-WIDTH = 320
+HEIGHT = 160
+WIDTH = 240
 
 FIXED_DELTA_SECONDS = 0.2
 
@@ -32,8 +32,8 @@ class CarEnvironment(gym.Env):
     front_camera = None
     CAMERA_POS_Z = 1.3
     CAMERA_POS_X = 1.4
-    PREFERRED_SPEED = 20  # what it says
-    SPEED_THRESHOLD = 2  # defines when we get close to desired speed so we drop the
+    PREFERRED_SPEED = 20
+    SPEED_THRESHOLD = 2
 
     metadata = {"render.modes": []}
 
@@ -216,16 +216,6 @@ class CarEnvironment(gym.Env):
             cv2.imshow("Sem Camera", cam)
             cv2.waitKey(1)
 
-        # track steering lock duration
-        lock_duration = 0.0
-        if not self.steering_lock:
-            if steer < -0.6 or steer > 0.6:
-                self.steering_lock = True
-                self.steering_lock_start = time.time()
-        else:
-            if steer < -0.6 or steer > 0.6:
-                lock_duration = time.time() - self.steering_lock_start
-
         # get angle and distance to the navigation route
         angle, distance = None, None
         while angle is None:
@@ -243,14 +233,6 @@ class CarEnvironment(gym.Env):
             terminated = True
             reward -= 200.0
             self.cleanup()
-
-        # punish for steer lock up
-        if lock_duration > 3:
-            reward -= 100.0
-            terminated = True
-            self.cleanup()
-        elif lock_duration > 1:
-            reward -= 50.0
 
         # punish for deviating from the route
         route_loss = distance - self.last_distance_to_route
