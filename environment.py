@@ -27,27 +27,11 @@ class CarEnvironment(gym.Env):
 	front_camera = None
 	CAMERA_POS_Z = 1.3 
 	CAMERA_POS_X = 1.4
-	PREFERRED_SPEED = 20 # what it says
-	SPEED_THRESHOLD = 2 #defines when we get close to desired speed so we drop the
 	
 	def __init__(self):
 		super(CarEnvironment, self).__init__()
-        # Define action and observation space
-        # They must be gym.spaces objects
 
-		self.action_space = spaces.MultiDiscrete([9])
-        # First discrete variable with 9 possible actions for steering with middle being straight
-        # Second discrete variable with 4 possible actions for throttle/braking
-
-        # Example for using image as input normalised to 0..1 (channel-first; channel-last also works):
-		# adding a separate input of an angle to a close waypoint along the route
-		
-		# old dict 
-		#self.observation_space = spaces.Dict({
-        #    'image': spaces.Box(low=0.0, high=1.0,shape=(HEIGHT, WIDTH, N_CHANNELS), dtype=np.float32),
-        #    'float_input': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        #})
-
+		self.action_space = spaces.MultiDiscrete([9, 9, 9])
 		self.observation_space = spaces.Dict({
             'image': spaces.Box(low=0.0, high=1.0,shape=(HEIGHT, WIDTH, N_CHANNELS), dtype=np.float32),
             'angle': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
@@ -130,18 +114,6 @@ class CarEnvironment(gym.Env):
 			actor.destroy()
 		cv2.destroyAllWindows()
 	
-	def maintain_speed(self,current_speed):
-			''' 
-			this is a very simple function to maintan desired speed
-			s arg is actual current speed
-			'''
-			if current_speed >= self.PREFERRED_SPEED:
-				return 0
-			elif current_speed < self.PREFERRED_SPEED - self.SPEED_THRESHOLD:
-				return 0.7 
-			else:
-				return 0.3 
-	
 	def step(self, action):
 		self.step_counter +=1
 		steer = action[0]
@@ -165,13 +137,10 @@ class CarEnvironment(gym.Env):
 		elif steer ==8:
 			steer = 0.9
 		# map throttle to maintain speed and apply steer and throttle	
-		velocity_vector = self.vehicle.get_velocity()
-		speed_kmh = int(3.6 * math.sqrt(velocity_vector.x**2 + velocity_vector.y**2 + velocity_vector.z**2))
-		estimated_throttle = self.maintain_speed(speed_kmh)
-		self.vehicle.apply_control(carla.VehicleControl(throttle=estimated_throttle, steer=steer, brake = 0.0))
-		
-		if self.step_counter % 50 == 0:
-			print('steer input from model:',steer)
+
+		throttle = action[1] / 9
+		brake = action[2] / 9
+		self.vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
 		
 		total_distance_travelled = self.initial_location.distance(self.vehicle.get_location())
 		step_distance_gain = 0
@@ -209,9 +178,8 @@ class CarEnvironment(gym.Env):
 			reward = reward - 2
 		if distance_to_route > 20:
 			reward = reward - 100
-		# reward for making distance
+
 		reward = reward + int(round(step_distance_gain*3,0))
-		# check for episode duration
 		if self.episode_start + SECONDS_PER_EPISODE < time.time():
 			done = True
 			self.cleanup()
