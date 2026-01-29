@@ -1,230 +1,166 @@
+import datetime
 import os
-import time
-import random
-import cv2
-from environment import ActorCritic, CarEnvironment
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import carla
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
+
+from environment import ActorCritic, CarEnvironment
+
+# Match environment constants
+HEIGHT = 180
+WIDTH = 240
+N_CHANNELS = 3
 
 
-def compute_gae(
-    rewards, dones, values, gamma=0.99, lam=0.95
-):
-    advantages = np.zeros_like(rewards, dtype=np.float32)
-    gae = 0.0
-    for step in reversed(range(len(rewards))):
-        next_non_terminal = 1.0 - dones[step]
-        next_value = values[step + 1] if step + 1 < len(values) else 0.0
-        delta = rewards[step] + gamma * next_value * next_non_terminal - values[step]
-        gae = delta + gamma * lam * next_non_terminal * gae
-        advantages[step] = gae
-    returns = advantages + values[:-1]
+def dict_obs_to_tensor(obs, device):
+    """Convert dict observation to batched tensors (1, ...)."""
+    image = torch.from_numpy(obs["image"]).float().to(device)
+    # (H, W, C) -> (1, C, H, W)
+    image = image.permute(2, 0, 1).unsqueeze(0)
+    angle = torch.from_numpy(np.asarray(obs["angle"], dtype=np.float32)).float().to(device).reshape(1, 1)
+    return image, angle
+
+def compute_gae_and_returns(rewards, dones, values, next_value, next_done, gamma=0.99, gae_lambda=0.95):
+    """Compute advantages and returns for a rollout."""
+    advantages = torch.zeros_like(values)
+    lastgaelam = 0
+    for t in reversed(range(len(rewards))):
+        if t == len(rewards) - 1:
+            nextnonterminal = 1.0 - next_done
+            nextvalues = next_value
+        else:
+            nextnonterminal = 1.0 - dones[t + 1]
+            nextvalues = values[t + 1]
+        delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
+        advantages[t] = lastgaelam = delta + gamma * gae_lambda * lastgaelam * nextnonterminal
+    returns = advantages + values
     return advantages, returns
 
 
+def ppo_update(
+    model,
+    images,
+    angles,
+    actions,
+    log_probs_old,
+    advantages,
+    returns,
+    clip_eps=0.2,
+    value_coef=0.5,
+    entropy_coef=0.01,
+):
+    """One PPO update over the collected batch."""
+    _, log_prob, entropy, value = model.get_action_and_value(images, angles, action=actions)
+    ratio = (log_prob - log_probs_old).exp()
+    surr1 = ratio * advantages
+    surr2 = ratio.clamp(1 - clip_eps, 1 + clip_eps) * advantages
+    policy_loss = -torch.min(surr1, surr2).mean()
+    value_loss = F.mse_loss(value, returns)
+    entropy_loss = -entropy.mean()
+    loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
+    model.optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    model.optimizer.step()
+    return policy_loss.item(), value_loss.item(), entropy_loss.item()
+
+
+def collect_rollout(env, model, device, n_steps):
+    """Collect n_steps of experience. Returns lists of tensors (on device)."""
+    images_list, angles_list = [], []
+    actions_list, rewards_list, dones_list, log_probs_list, values_list = [], [], [], [], []
+
+    obs, _ = env.reset()
+    image, angle = dict_obs_to_tensor(obs, device)
+    next_done = torch.zeros(1, device=device)
+
+    for _ in range(n_steps):
+        with torch.no_grad():
+            action, log_prob, _, value = model.get_action_and_value(image, angle)
+        act_np = action.cpu().numpy().squeeze(0)
+        next_obs, reward, terminated, truncated, _ = env.step(act_np)
+        done = terminated or truncated
+
+        images_list.append(image)
+        angles_list.append(angle)
+        actions_list.append(action)
+        rewards_list.append(reward)
+        dones_list.append(torch.tensor([float(done)], device=device))
+        log_probs_list.append(log_prob)
+        values_list.append(value)
+
+        if done:
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+        image, angle = dict_obs_to_tensor(obs, device)
+        next_done = torch.tensor([float(done)], device=device)
+
+    with torch.no_grad():
+        next_value = model.get_value(image, angle)
+
+    images = torch.cat(images_list, dim=0)
+    angles = torch.cat(angles_list, dim=0)
+    actions = torch.cat(actions_list, dim=0)
+    rewards = torch.tensor(rewards_list, device=device, dtype=torch.float32)
+    dones = torch.cat(dones_list, dim=0)
+    log_probs_old = torch.cat(log_probs_list, dim=0)
+    values = torch.cat(values_list, dim=0)
+
+    advantages, returns = compute_gae_and_returns(
+        rewards, dones, values, next_value, next_done
+    )
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    return images, angles, actions, log_probs_old, advantages, returns, rewards
+
+
 def main():
-    print("Setting folders for logs and models")
-    models_dir = f"models/{int(time.time())}/"
-    logdir = f"logs/{int(time.time())}/"
+    models_directory = f"models/{datetime.datetime.now().strftime('%I-%M%p-%B-%d-%Y')}/"
+    logs_directory = f"logs/{datetime.datetime.now().strftime('%I-%M%p-%B-%d-%Y')}/"
 
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(logdir, exist_ok=True)
+    if not os.path.exists(models_directory):
+        os.makedirs(models_directory)
+    if not os.path.exists(logs_directory):
+        os.makedirs(logs_directory)
 
-    print("Connecting to env..")
-    env = CarEnvironment()
-    # 
-    seed = 45
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    obs, _ = env.reset(seed=seed)
-    print("Env has been reset as part of launch")
-    print("Observation space:", env.observation_space)
-
-    num_actions = int(env.action_space.nvec[0])
+    print("connecting to env..")
+    environment = CarEnvironment()
+    seed = 2025
+    environment.reset(seed=seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    policy = ActorCritic(num_actions=num_actions).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=3e-4)
+    model = ActorCritic(lr=0.001).to(device)
+    writer = SummaryWriter(logs_directory, comment="PPO")
 
-    # PPO hyperparameters
-    max_env_steps = 2_000_000
-    update_timesteps = 16
-    epochs = 10
-    batch_size = 16
-    gamma = 0.99
-    gae_lambda = 0.95
-    clip_eps = 0.2
-    vf_coef = 0.5
-    ent_coef = 0.01
+    TIMESTEPS_PER_ITERATION = 100
+    training_iteration = 0
 
-    timestep = 0
+    while training_iteration < 4:
+        training_iteration += 1
+        print("Iteration ", training_iteration, " is to commence...")
 
-    obs_buffer = []
-    angle_buffer = []
-    action_buffer = []
-    logprob_buffer = []
-    reward_buffer = []
-    done_buffer = []
-    value_buffer = []
+        images, angles, actions, log_probs_old, advantages, returns, rewards = collect_rollout(
+            environment, model, device, TIMESTEPS_PER_ITERATION
+        )
 
-    episode_rewards = []
-    ep_reward = 0.0
-
-    try:
-        # collect trajectories
-        while len(reward_buffer) < update_timesteps:
-            action, logprob, value = policy.act(obs, device)
-
-            # env expects MultiDiscrete([9]) -> wrap action in array
-            next_obs, reward, terminated, truncated, _ = env.step(np.array([action]))
-            done = terminated or truncated
-
-            obs_buffer.append(obs["image"])
-            angle_buffer.append(obs["angle"])
-            action_buffer.append(action)
-            logprob_buffer.append(logprob)
-            reward_buffer.append(reward)
-            done_buffer.append(float(done))
-            value_buffer.append(value)
-
-            ep_reward += reward
-            timestep += 1
-
-            obs = next_obs
-
-            if done:
-                episode_rewards.append(ep_reward)
-                print(
-                    f"Step {timestep} | Episode reward: {ep_reward:.1f} | Episodes: {len(episode_rewards)}"
-                )
-                ep_reward = 0.0
-                obs, _ = env.reset()
-
-            if timestep >= max_env_steps:
-                break
-
-        # Add last value for GAE
-        with torch.no_grad():
-            _, last_value = policy.forward(
-                torch.from_numpy(obs["image"])
-                .float()
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .to(device),
-                torch.from_numpy(obs["angle"].astype(np.float32))
-                .view(1, -1)
-                .to(device),
+        # PPO update (several epochs over the same batch)
+        for _ in range(4):
+            pl, vl, el = ppo_update(
+                model, images, angles, actions, log_probs_old, advantages, returns
             )
-            last_value = last_value.cpu().numpy()[0, 0]
+        mean_reward = rewards.mean().item()
+        writer.add_scalar("train/mean_reward", mean_reward, training_iteration * TIMESTEPS_PER_ITERATION)
+        writer.add_scalar("train/policy_loss", pl, training_iteration * TIMESTEPS_PER_ITERATION)
+        writer.add_scalar("train/value_loss", vl, training_iteration * TIMESTEPS_PER_ITERATION)
 
-        values_np = np.array(value_buffer + [last_value], dtype=np.float32)
-        rewards_np = np.array(reward_buffer, dtype=np.float32)
-        dones_np = np.array(done_buffer, dtype=np.float32)
+        print("Iteration ", training_iteration, " has been trained")
+        save_path = f"{models_directory}/{TIMESTEPS_PER_ITERATION * training_iteration}"
+        torch.save(model.state_dict(), save_path)
 
-        advantages, returns = compute_gae(
-            rewards_np, dones_np, values_np, gamma=gamma, lam=gae_lambda
-        )
-
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # Prepare tensors
-        images_t = (
-            torch.from_numpy(np.stack(obs_buffer))
-            .float()
-            .permute(0, 3, 1, 2)
-            .to(device)
-        )
-        angles_t = (
-            torch.from_numpy(np.stack(angle_buffer).astype(np.float32))
-            .view(-1, 1)
-            .to(device)
-        )
-        actions_t = torch.from_numpy(np.array(action_buffer)).long().to(device)
-        old_logprobs_t = torch.from_numpy(np.array(logprob_buffer)).float().to(device)
-        returns_t = torch.from_numpy(returns).float().to(device)
-        advantages_t = torch.from_numpy(advantages).float().to(device)
-
-        dataset_size = len(reward_buffer)
-        indices = np.arange(dataset_size)
-
-        for _ in range(epochs):
-            np.random.shuffle(indices)
-            for start in range(0, dataset_size, batch_size):
-                end = start + batch_size
-                mb_idx = indices[start:end]
-
-                mb_images = images_t[mb_idx]
-                mb_angles = angles_t[mb_idx]
-                mb_actions = actions_t[mb_idx]
-                mb_old_logprobs = old_logprobs_t[mb_idx]
-                mb_returns = returns_t[mb_idx]
-                mb_advantages = advantages_t[mb_idx]
-
-                new_logprobs, values, entropy = policy.evaluate_actions(
-                    mb_images, mb_angles, mb_actions
-                )
-
-                ratio = torch.exp(new_logprobs - mb_old_logprobs)
-                surr1 = ratio * mb_advantages
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-
-                value_loss = nn.functional.mse_loss(values, mb_returns)
-                entropy_loss = -entropy.mean()
-
-                loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
-                optimizer.step()
-
-        print(
-            f"PPO update at step {timestep} | mean ep reward (last 10): "
-            f"{np.mean(episode_rewards[-10:]) if episode_rewards else 0.0:.1f}"
-        )
-
-        # Clear buffers
-        obs_buffer.clear()
-        angle_buffer.clear()
-        action_buffer.clear()
-        logprob_buffer.clear()
-        reward_buffer.clear()
-        done_buffer.clear()
-        value_buffer.clear()
-
-        # Save model periodically
-        torch.save(
-            {
-                "policy_state_dict": policy.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "timestep": timestep,
-            },
-            os.path.join(models_dir, f"ppo_step_{timestep}.pt"),
-        )
-
-    except KeyboardInterrupt:
-        print("Training interrupted by user.")
-    finally:
-        print("Saving final model...")
-        torch.save(
-            {
-                "policy_state_dict": policy.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "timestep": timestep,
-            },
-            os.path.join(models_dir, f"ppo_final_step_{timestep}.pt"),
-        )
-        try:
-            env.cleanup()
-        except Exception:
-            pass
+    writer.close()
 
 
 if __name__ == "__main__":

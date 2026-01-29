@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import carla
+import torch.nn.functional as F
 # Make sure CARLA PythonAPI is on the path (tweak to where you put CARLA)
 sys.path.append("E:/CARLA_0.9.15/WindowsNoEditor/PythonAPI/carla")
 from agents.navigation.global_route_planner import GlobalRoutePlanner
@@ -19,6 +20,8 @@ SECONDS_PER_EPISODE = 25
 N_CHANNELS = 3
 HEIGHT = 160
 WIDTH = 240
+N_ACTIONS_PER_DIM = 9
+N_ACTION_DIMS = 3
 
 FIXED_DELTA_SECONDS = 0.2
 
@@ -325,77 +328,46 @@ class CarEnvironment(gym.Env):
         self.collision_hist.append(event)
 
 class ActorCritic(nn.Module):
-    def __init__(self, num_actions):
+    def __init__(self, lr=0.001):
         super().__init__()
+        self.conv1 = nn.Conv2d(N_CHANNELS, 32, 8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, 3, stride=1)
+        # Spatial size after convs: (H,W) -> (39,59) -> (18,28) -> (16,26) for 160x240 input
+        self.conv_out_size = 64 * 16 * 26  # 26624 for HEIGHT=160, WIDTH=240
+        self.fc_features = nn.Linear(self.conv_out_size + 1, 256)
 
-        # CNN for image
-        self.cnn = nn.Sequential(
-            nn.Conv2d(N_CHANNELS, 16, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
+        self.policy_heads = nn.ModuleList([
+            nn.Linear(256, N_ACTIONS_PER_DIM) for _ in range(N_ACTION_DIMS)
+        ])
+        self.value_head = nn.Linear(256, 1)
 
-        # compute conv output size lazily
-        with torch.no_grad():
-            dummy = torch.zeros(1, N_CHANNELS, HEIGHT, WIDTH)
-            conv_out_size = self.cnn(dummy).shape[1]
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
-        self.fc = nn.Sequential(
-            nn.Linear(conv_out_size + 1, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-        )
-
-        self.policy_head = nn.Linear(128, num_actions)
-        self.value_head = nn.Linear(128, 1)
-
-    def forward(self, image: torch.Tensor, angle: torch.Tensor):
-        # image: (B, C, H, W), angle: (B, 1)
-        x = self.cnn(image)
+    def _features(self, image, angle):
+        x = F.relu(self.conv1(image))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
         x = torch.cat([x, angle], dim=1)
-        x = self.fc(x)
-        logits = self.policy_head(x)
-        value = self.value_head(x)
+        x = F.relu(self.fc_features(x))
+        return x
+
+    def forward(self, image, angle):
+        features = self._features(image, angle)
+        logits = [head(features) for head in self.policy_heads]
+        value = self.value_head(features).squeeze(-1)
         return logits, value
 
-    def act(self, obs, device):
-        image = obs["image"]
-        angle = obs["angle"]
+    def get_action_and_value(self, image, angle, action=None):
+        logits, value = self.forward(image, angle)
+        dists = [torch.distributions.Categorical(logits=lg) for lg in logits]
+        if action is None:
+            action = torch.stack([d.sample() for d in dists], dim=1)
+        log_prob = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
+        entropy = sum(d.entropy() for d in dists)
+        return action, log_prob, entropy, value
 
-        if isinstance(image, np.ndarray):
-            image_t = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0)
-        else:
-            raise TypeError("Expected image as numpy array")
-
-        if isinstance(angle, np.ndarray):
-            angle_t = torch.from_numpy(angle.astype(np.float32)).view(1, -1)
-        else:
-            angle_t = torch.tensor([[float(angle)]], dtype=torch.float32)
-
-        image_t = image_t.to(device)
-        angle_t = angle_t.to(device)
-
-        logits, value = self.forward(image_t, angle_t)
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        logprob = dist.log_prob(action)
-
-        return (
-            action.cpu().numpy()[0],
-            logprob.detach().cpu().numpy()[0],
-            value.detach().cpu().numpy()[0, 0],
-        )
-
-    def evaluate_actions(
-        self, images: torch.Tensor, angles: torch.Tensor, actions: torch.Tensor
-    ):
-        logits, values = self.forward(images, angles)
-        dist = torch.distributions.Categorical(logits=logits)
-        logprobs = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return logprobs, torch.squeeze(values, -1), entropy
+    def get_value(self, image, angle):
+        _, value = self.forward(image, angle)
+        return value
