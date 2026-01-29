@@ -4,8 +4,8 @@ from stable_baselines3 import PPO #PPO
 import os
 
 
-models_directory = f"models/{datetime.datetime.now().strftime("%I:%M%p on %B %d, %Y")}/"
-logs_directory = f"logs/{datetime.datetime.now().strftime("%I:%M%p on %B %d, %Y")}/"
+models_directory = f"models/{datetime.datetime.now().strftime("%I-%M%p-%B-%d-%Y")}/"
+logs_directory = f"logs/{datetime.datetime.now().strftime("%I-%M%p-%B-%d-%Y")}/"
 
 if not os.path.exists(models_directory):
 	os.makedirs(models_directory)
