@@ -42,7 +42,7 @@ class CarEnvironment(gym.Env):
 
         # Action space: 9 discrete steering values (mapped to [-0.9, 0.9])
         # We keep MultiDiscrete for compatibility with existing mapping
-        self.action_space = spaces.MultiDiscrete([9])
+        self.action_space = spaces.MultiDiscrete([9, 3, 3])
 
         # Observation space: dict with image and angle to next waypoint
         self.observation_space = spaces.Dict(
@@ -159,19 +159,6 @@ class CarEnvironment(gym.Env):
             actor.destroy()
         cv2.destroyAllWindows()
 
-    def maintain_speed(self, s: float):
-        """
-        Very simple function to maintain desired speed.
-
-        s arg is actual current speed in km/h.
-        """
-        if s >= self.PREFERRED_SPEED:
-            return 0.0
-        elif s < self.PREFERRED_SPEED - self.SPEED_THRESHOLD:
-            return 0.7  # think of it as % of "full gas"
-        else:
-            return 0.3  # tweak this if the car is way over or under preferred speed
-
     def _map_action_to_steer(self, action):
         # Mapping from discrete id to steering value
         mapping = {
@@ -190,16 +177,23 @@ class CarEnvironment(gym.Env):
     def step(self, action):
         self.step_counter += 1
 
-        # MultiDiscrete([9]) -> take first component
-        steer_idx = action[0] if isinstance(action, (list, np.ndarray)) else action
+        # Action can be:
+        # - legacy: single steer_idx (int) or [steer_idx]
+        # - extended: [steer_idx, throttle, brake]
+        steer_idx = None
+        throttle = None
+        brake = None
+
+        steer_idx = action[0]
+        throttle = float(action[1])/3
+        brake = float(action[2])/3
+
+        # Map steering index to steering value
         steer = self._map_action_to_steer(steer_idx)
 
-        # map throttle to maintain speed and apply steer and throttle
-        v = self.vehicle.get_velocity()
-        kmh = int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))
-        estimated_throttle = self.maintain_speed(kmh)
+        # Apply control using steer, throttle and brake
         self.vehicle.apply_control(
-            carla.VehicleControl(throttle=estimated_throttle, steer=steer, brake=0.0)
+            carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
         )
 
         if self.step_counter % 50 == 0:
